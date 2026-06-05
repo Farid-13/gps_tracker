@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -13,8 +14,95 @@ import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart' as ll;
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 const bool debugMode = true;
+const Duration kGpsSendInterval = Duration(minutes: 1);
+// Локальный буфер только для UI/диагностики; сервер хранит полную историю.
+const int kGpsLogLimit = 100;
+const int kFlushBatchSize = 30;
+const String kInstallIdPrefsKey = 'gps_tracker_installation_uid';
+
+Timer? _gpsTimer;
+bool _isCollectingNow = false;
+bool _backgroundWorkerStarted = false;
+
+class DeviceContext {
+  final String installationUid;
+  final String brand;
+  final String model;
+  final String manufacturer;
+  final String device;
+  final String fingerprint;
+  final String osVersion;
+  final String isPhysicalDevice;
+
+  const DeviceContext({
+    required this.installationUid,
+    required this.brand,
+    required this.model,
+    required this.manufacturer,
+    required this.device,
+    required this.fingerprint,
+    required this.osVersion,
+    required this.isPhysicalDevice,
+  });
+}
+
+String _safeStr(String? value) {
+  final trimmed = value?.trim() ?? '';
+  return trimmed.isEmpty ? 'unknown' : trimmed;
+}
+
+Future<String> _getOrCreateInstallationUid() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(kInstallIdPrefsKey);
+    if (saved != null && saved.isNotEmpty) return saved;
+
+    final randomPart = Random().nextInt(0x7fffffff).toRadixString(16);
+    final uid = 'gps-${DateTime.now().millisecondsSinceEpoch}-$randomPart';
+    await prefs.setString(kInstallIdPrefsKey, uid);
+    return uid;
+  } catch (_) {
+    final randomPart = Random().nextInt(0x7fffffff).toRadixString(16);
+    return 'gps-${DateTime.now().millisecondsSinceEpoch}-$randomPart';
+  }
+}
+
+Future<DeviceContext> _loadDeviceContext() async {
+  final installationUid = await _getOrCreateInstallationUid();
+
+  try {
+    if (Platform.isAndroid) {
+      final androidInfo = await DeviceInfoPlugin().androidInfo;
+      return DeviceContext(
+        installationUid: installationUid,
+        brand: _safeStr(androidInfo.brand),
+        model: _safeStr(androidInfo.model),
+        manufacturer: _safeStr(androidInfo.manufacturer),
+        device: _safeStr(androidInfo.device),
+        fingerprint: _safeStr(androidInfo.fingerprint),
+        osVersion: 'Android ${_safeStr(androidInfo.version.release)} (SDK ${androidInfo.version.sdkInt})',
+        isPhysicalDevice: androidInfo.isPhysicalDevice ? 'true' : 'false',
+      );
+    }
+  } catch (e) {
+    debugPrint('Device info read failed: $e');
+  }
+
+  return DeviceContext(
+    installationUid: installationUid,
+    brand: 'unknown',
+    model: 'unknown',
+    manufacturer: 'unknown',
+    device: 'unknown',
+    fingerprint: 'unknown',
+    osVersion: 'unknown',
+    isPhysicalDevice: 'unknown',
+  );
+}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -24,8 +112,6 @@ void main() async {
     statusBarIconBrightness: Brightness.dark,
   ));
 
-  await _checkLocationPermissions();
-  await initializeBackgroundService();
   runApp(const MyApp());
 }
 
@@ -41,16 +127,24 @@ Future<void> _checkLocationPermissions() async {
   if (permission == LocationPermission.deniedForever) return;
 }
 
-Future<void> initializeBackgroundService() async {
+Future<void> initializeBackgroundService({
+  bool autoStart = false,
+  bool autoStartOnBoot = false,
+}) async {
   final service = FlutterBackgroundService();
   const AndroidNotificationChannel channel = AndroidNotificationChannel(
     'gps_tracker_channel', 
     'Enterprise GPS Service',
     description: 'Этот канал используется для постоянного сбора геоданных в фоне',
-    importance: Importance.high, // Повышаем важность до High для стабильности логов
+    // Low: сервис остаётся foreground, но не шумит уведомлениями.
+    importance: Importance.low,
   );
 
   final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
+  const initializationSettingsAndroid = AndroidInitializationSettings('@mipmap/ic_launcher');
+  await flutterLocalNotificationsPlugin.initialize(
+    const InitializationSettings(android: initializationSettingsAndroid),
+  );
   await flutterLocalNotificationsPlugin
       .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
       ?.createNotificationChannel(channel);
@@ -58,13 +152,14 @@ Future<void> initializeBackgroundService() async {
   await service.configure(
     androidConfiguration: AndroidConfiguration(
       onStart: onStart,
-      autoStart: true,
+      autoStart: autoStart,
       isForegroundMode: true, // Foreground-сервис остаётся живым в фоне
+      foregroundServiceTypes: [AndroidForegroundType.location],
       notificationChannelId: 'gps_tracker_channel',
       initialNotificationTitle: '📍 Мой GPS Локатор',
       initialNotificationContent: 'Сбор геоданных активен в фоновом режиме...',
       foregroundServiceNotificationId: 888,
-      autoStartOnBoot: true, // Стартовать при перезагрузке
+      autoStartOnBoot: autoStartOnBoot,
     ),
     iosConfiguration: IosConfiguration(
       autoStart: true,
@@ -82,19 +177,33 @@ bool onStartBackground(ServiceInstance service) {
 
 @pragma('vm:entry-point')
 void onStart(ServiceInstance service) async {
+  if (_backgroundWorkerStarted) return;
+  _backgroundWorkerStarted = true;
+
   DartPluginRegistrant.ensureInitialized();
   final dbPath = await getDatabasesPath();
   final path = p.join(dbPath, 'gps_tracker.db');
   
   final database = await openDatabase(
     path, 
-    version: 1,
+    version: 2,
     onCreate: (db, version) async {
       await db.execute(
         'CREATE TABLE gps_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, latitude REAL, longitude REAL)'
       );
+      await db.execute(
+        'CREATE TABLE gps_unsent (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, latitude REAL, longitude REAL)'
+      );
+    },
+    onUpgrade: (db, oldVersion, newVersion) async {
+      if (oldVersion < 2) {
+        await db.execute(
+          'CREATE TABLE IF NOT EXISTS gps_unsent (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, latitude REAL, longitude REAL)',
+        );
+      }
     },
   );
+  final deviceContext = await _loadDeviceContext();
 
   // Функция для безопасной передачи свежих логов из БД прямо в UI-интерфейс
   Future<void> sendDataToUi(String status, double currentLat, double currentLon, String currentTime, {String debugInfo = ''}) async {
@@ -117,17 +226,95 @@ void onStart(ServiceInstance service) async {
 
   // Функция для сбора GPS координат
   Future<void> collectGpsData() async {
+    if (_isCollectingNow) return;
+    _isCollectingNow = true;
+
     String timeStamp = DateFormat('yyyy-MM-dd HH:mm:ss').format(DateTime.now());
     double lat = 0.0;
     double lon = 0.0;
+    bool isFakeGps = false;
+
+    Future<bool> sendPointToApi(double apiLat, double apiLon, String apiTimestamp) async {
+      try {
+        final response = await http
+            .post(
+              Uri.parse('http://89.147.202.166:1153/tayqa/tiger/api/development/v5.40/DynamicApi/PostDynamicData/GpsTracker_Ferid'),
+              headers: {
+                'Content-Type': 'application/json',
+                'username': 'faridq',
+              },
+              body: jsonEncode({
+                'Latitude': apiLat.toString(),
+                'Longitude': apiLon.toString(),
+                'GpsDate': apiTimestamp,
+                'DeviceUid': deviceContext.installationUid,
+                'DeviceBrand': deviceContext.brand,
+                'DeviceModel': deviceContext.model,
+                'DeviceManufacturer': deviceContext.manufacturer,
+                'DeviceName': deviceContext.device,
+                'DeviceFingerprint': deviceContext.fingerprint,
+                'DeviceOs': deviceContext.osVersion,
+                'IsPhysicalDevice': deviceContext.isPhysicalDevice,
+              }),
+            )
+            .timeout(const Duration(seconds: 15));
+        return response.statusCode == 200;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    Future<void> enqueueForSending(double queueLat, double queueLon, String queueTimestamp) async {
+      await database.insert('gps_unsent', {
+        'timestamp': queueTimestamp,
+        'latitude': queueLat,
+        'longitude': queueLon,
+      });
+    }
+
+    Future<int> flushPendingQueue() async {
+      int sentCount = 0;
+      final pendingRows = await database.query(
+        'gps_unsent',
+        orderBy: 'id ASC',
+        limit: kFlushBatchSize,
+      );
+
+      for (final row in pendingRows) {
+        final int rowId = (row['id'] as num).toInt();
+        final double rowLat = row['latitude'] is String
+            ? double.tryParse(row['latitude'].toString()) ?? -1.0
+            : (row['latitude'] as num).toDouble();
+        final double rowLon = row['longitude'] is String
+            ? double.tryParse(row['longitude'].toString()) ?? -1.0
+            : (row['longitude'] as num).toDouble();
+        final String rowTimestamp = row['timestamp']?.toString() ?? '';
+
+        final bool isSent = await sendPointToApi(rowLat, rowLon, rowTimestamp);
+        if (!isSent) break;
+
+        await database.delete('gps_unsent', where: 'id = ?', whereArgs: [rowId]);
+        sentCount++;
+      }
+
+      return sentCount;
+    }
+
+    Future<int> getPendingCount() async {
+      final count = Sqflite.firstIntValue(
+        await database.rawQuery('SELECT COUNT(*) FROM gps_unsent'),
+      );
+      return count ?? 0;
+    }
 
     try {
       Position position = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-        timeLimit: const Duration(seconds: 15),
+        desiredAccuracy: LocationAccuracy.medium,
+        timeLimit: const Duration(seconds: 10),
       );
-      lat = position.latitude;
-      lon = position.longitude;
+      isFakeGps = position.isMocked;
+      lat = isFakeGps ? -1.0 : position.latitude;
+      lon = isFakeGps ? -1.0 : position.longitude;
 
       // Запись точки в SQLite
       await database.insert('gps_logs', {
@@ -135,22 +322,27 @@ void onStart(ServiceInstance service) async {
         'latitude': lat,
         'longitude': lon,
       });
+      await database.execute(
+        'DELETE FROM gps_logs WHERE id NOT IN (SELECT id FROM gps_logs ORDER BY id DESC LIMIT $kGpsLogLimit)',
+      );
 
-      // Отправка на ваш корпоративный сервер
-      final response = await http.post(
-        Uri.parse('http://89.147.202.166:1153/tayqa/tiger/api/development/v5.40/DynamicApi/PostDynamicData/GpsTracker_Ferid'),
-        headers: {
-          'Content-Type': 'application/json', 
-          'username': 'faridq'
-        },
-        body: jsonEncode({
-          'Latitude': lat.toString(),
-          'Longitude': lon.toString(),
-          'GpsDate': timeStamp,
-        }),
-      ).timeout(const Duration(seconds: 15));
+      // Каждая точка сначала попадает в очередь, затем отправляется на API.
+      await enqueueForSending(lat, lon, timeStamp);
+      final int sentNow = await flushPendingQueue();
+      final int pendingCount = await getPendingCount();
 
-      String currentStatus = response.statusCode == 200 ? "В сети (ОК)" : "Ошибка API: ${response.statusCode}";
+      String currentStatus;
+      if (pendingCount > 0) {
+        if (isFakeGps) {
+          currentStatus = 'Fake GPS: -1, в очереди $pendingCount';
+        } else if (sentNow > 0) {
+          currentStatus = 'Частично отправлено, в очереди $pendingCount';
+        } else {
+          currentStatus = 'Нет сети, в очереди $pendingCount';
+        }
+      } else {
+        currentStatus = isFakeGps ? 'Fake GPS: отправлено -1' : 'В сети (ОК)';
+      }
       await sendDataToUi(currentStatus, lat, lon, timeStamp);
 
     } on TimeoutException catch (e, stack) {
@@ -200,6 +392,8 @@ void onStart(ServiceInstance service) async {
       final message = e.toString();
       final shortMessage = message.length <= 40 ? message : '${message.substring(0, 40)}...';
       await sendDataToUi('Сбой службы: $shortMessage', lat, lon, timeStamp, debugInfo: debugText);
+    } finally {
+      _isCollectingNow = false;
     }
   }
 
@@ -213,8 +407,16 @@ void onStart(ServiceInstance service) async {
   });
 
   // Периодически собираем GPS координаты каждые 60 секунд
-  Timer.periodic(const Duration(seconds: 60), (timer) async {
+  _gpsTimer?.cancel();
+  _gpsTimer = Timer.periodic(kGpsSendInterval, (timer) async {
     await collectGpsData();
+  });
+
+  service.on('stop_service').listen((_) async {
+    _gpsTimer?.cancel();
+    _gpsTimer = null;
+    await database.close();
+    _backgroundWorkerStarted = false;
   });
 }
 
@@ -225,7 +427,7 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'GPS Мониторинг',
+      title: 'tixa',
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(
@@ -258,15 +460,12 @@ class _GpsTrackerScreenState extends State<GpsTrackerScreen> {
   String _lat = "0.0000", _lon = "0.0000", _time = "--:--:--", _status = "Запуск сервиса...";
   String _debugInfo = '';
   List<dynamic> _savedLogs = [];
+  bool _isBootstrappingService = false;
 
   @override
   void initState() {
     super.initState();
-    
-    // При старте экрана просим фоновый поток выдать нам последние логи
-    Timer(const Duration(milliseconds: 600), () {
-      FlutterBackgroundService().invoke('refresh_logs');
-    });
+    _bootstrapBackgroundTracking();
 
     // Принимаем регулярные пакеты обновлений геоданных и логов от сервиса
     FlutterBackgroundService().on('update').listen((event) {
@@ -292,6 +491,37 @@ class _GpsTrackerScreenState extends State<GpsTrackerScreen> {
         });
       }
     });
+  }
+
+  Future<void> _bootstrapBackgroundTracking() async {
+    if (_isBootstrappingService) return;
+    _isBootstrappingService = true;
+
+    try {
+      await initializeBackgroundService(
+        autoStart: false,
+        autoStartOnBoot: false,
+      );
+      await _checkLocationPermissions();
+
+      final service = FlutterBackgroundService();
+      final isRunning = await service.isRunning();
+      if (!isRunning) {
+        await service.startService();
+      }
+
+      // После гарантированного старта службы подтягиваем последние логи в UI.
+      service.invoke('refresh_logs');
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _status = 'Ошибка запуска службы';
+          _debugInfo = e.toString();
+        });
+      }
+    } finally {
+      _isBootstrappingService = false;
+    }
   }
 
   void _openMiniMap(BuildContext currentContext, double latitude, double longitude, String timestamp) {
@@ -373,7 +603,7 @@ class _GpsTrackerScreenState extends State<GpsTrackerScreen> {
     return Scaffold(
       backgroundColor: Theme.of(context).colorScheme.surface,
       appBar: AppBar(
-        title: const Text('Мой GPS Монитор', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 20)),
+        title: const Text('tixa', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 20)),
         centerTitle: true,
         backgroundColor: Colors.white,
         elevation: 0,
