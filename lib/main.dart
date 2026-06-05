@@ -307,33 +307,29 @@ void onStart(ServiceInstance service) async {
       return count ?? 0;
     }
 
-    try {
-      Position position = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.medium,
-        timeLimit: const Duration(seconds: 10),
-      );
-      isFakeGps = position.isMocked;
-      lat = isFakeGps ? -1.0 : position.latitude;
-      lon = isFakeGps ? -1.0 : position.longitude;
-
-      // Запись точки в SQLite
+    Future<void> persistAndSyncPoint({
+      required double pointLat,
+      required double pointLon,
+      required String pointTimestamp,
+      required bool mocked,
+      String? statusWhenQueueEmpty,
+    }) async {
       await database.insert('gps_logs', {
-        'timestamp': timeStamp,
-        'latitude': lat,
-        'longitude': lon,
+        'timestamp': pointTimestamp,
+        'latitude': pointLat,
+        'longitude': pointLon,
       });
       await database.execute(
         'DELETE FROM gps_logs WHERE id NOT IN (SELECT id FROM gps_logs ORDER BY id DESC LIMIT $kGpsLogLimit)',
       );
 
-      // Каждая точка сначала попадает в очередь, затем отправляется на API.
-      await enqueueForSending(lat, lon, timeStamp);
+      await enqueueForSending(pointLat, pointLon, pointTimestamp);
       final int sentNow = await flushPendingQueue();
       final int pendingCount = await getPendingCount();
 
       String currentStatus;
       if (pendingCount > 0) {
-        if (isFakeGps) {
+        if (mocked) {
           currentStatus = 'Fake GPS: -1, в очереди $pendingCount';
         } else if (sentNow > 0) {
           currentStatus = 'Частично отправлено, в очереди $pendingCount';
@@ -341,14 +337,52 @@ void onStart(ServiceInstance service) async {
           currentStatus = 'Нет сети, в очереди $pendingCount';
         }
       } else {
-        currentStatus = isFakeGps ? 'Fake GPS: отправлено -1' : 'В сети (ОК)';
+        currentStatus = statusWhenQueueEmpty ?? (mocked ? 'Fake GPS: отправлено -1' : 'В сети (ОК)');
       }
-      await sendDataToUi(currentStatus, lat, lon, timeStamp);
+      await sendDataToUi(currentStatus, pointLat, pointLon, pointTimestamp);
+    }
+
+    try {
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.medium,
+        timeLimit: const Duration(seconds: 20),
+      );
+      isFakeGps = position.isMocked;
+      lat = isFakeGps ? -1.0 : position.latitude;
+      lon = isFakeGps ? -1.0 : position.longitude;
+      await persistAndSyncPoint(
+        pointLat: lat,
+        pointLon: lon,
+        pointTimestamp: timeStamp,
+        mocked: isFakeGps,
+      );
 
     } on TimeoutException catch (e, stack) {
       final debugText = 'TimeoutException: $e\n$stack';
       debugPrint('Background timeout error: $debugText');
-      await sendDataToUi('Таймаут сети', lat, lon, timeStamp, debugInfo: debugText);
+      try {
+        final Position? fallback = await Geolocator.getLastKnownPosition();
+        if (fallback != null) {
+          final bool fallbackMocked = fallback.isMocked;
+          final double fallbackLat = fallbackMocked ? -1.0 : fallback.latitude;
+          final double fallbackLon = fallbackMocked ? -1.0 : fallback.longitude;
+
+          await persistAndSyncPoint(
+            pointLat: fallbackLat,
+            pointLon: fallbackLon,
+            pointTimestamp: timeStamp,
+            mocked: fallbackMocked,
+            statusWhenQueueEmpty: fallbackMocked
+                ? 'Fake GPS: отправлено -1 (fallback)'
+                : 'GPS долго ищется, отправлена последняя точка',
+          );
+        } else {
+          await sendDataToUi('GPS долго ищется, ожидаем фиксацию', lat, lon, timeStamp, debugInfo: debugText);
+        }
+      } catch (fallbackError, fallbackStack) {
+        final fallbackDebug = '$debugText\nFallback error: $fallbackError\n$fallbackStack';
+        await sendDataToUi('GPS долго ищется, ожидаем фиксацию', lat, lon, timeStamp, debugInfo: fallbackDebug);
+      }
     } on SocketException catch (e, stack) {
       final debugText = 'SocketException: $e\n$stack';
       debugPrint('Background socket error: $debugText');
