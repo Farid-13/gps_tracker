@@ -27,6 +27,7 @@ const String kInstallIdPrefsKey = 'gps_tracker_installation_uid';
 Timer? _gpsTimer;
 bool _isCollectingNow = false;
 bool _backgroundWorkerStarted = false;
+StreamSubscription<ServiceStatus>? _gpsServiceStatusSubscription;
 
 class DeviceContext {
   final String installationUid;
@@ -128,8 +129,8 @@ Future<void> _checkLocationPermissions() async {
 }
 
 Future<void> initializeBackgroundService({
-  bool autoStart = false,
-  bool autoStartOnBoot = false,
+  bool autoStart = true,
+  bool autoStartOnBoot = true,
 }) async {
   final service = FlutterBackgroundService();
   const AndroidNotificationChannel channel = AndroidNotificationChannel(
@@ -343,6 +344,18 @@ void onStart(ServiceInstance service) async {
     }
 
     try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        await sendDataToUi('GPS выключен', 0.0, 0.0, timeStamp);
+        return;
+      }
+
+      final permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+        await sendDataToUi('Нет доступа к GPS', 0.0, 0.0, timeStamp);
+        return;
+      }
+
       Position position = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.medium,
         timeLimit: const Duration(seconds: 20),
@@ -446,9 +459,23 @@ void onStart(ServiceInstance service) async {
     await collectGpsData();
   });
 
+  // Когда пользователь снова включает GPS, сразу снимаем точку, не ждем таймер.
+  _gpsServiceStatusSubscription?.cancel();
+  _gpsServiceStatusSubscription = Geolocator.getServiceStatusStream().listen((status) async {
+    final nowTime = DateFormat('yyyy-MM-dd HH:mm:ss').format(DateTime.now());
+    if (status == ServiceStatus.enabled) {
+      await sendDataToUi('GPS включен, получаем координаты...', 0.0, 0.0, nowTime);
+      await collectGpsData();
+    } else {
+      await sendDataToUi('GPS выключен', 0.0, 0.0, nowTime);
+    }
+  });
+
   service.on('stop_service').listen((_) async {
     _gpsTimer?.cancel();
     _gpsTimer = null;
+    await _gpsServiceStatusSubscription?.cancel();
+    _gpsServiceStatusSubscription = null;
     await database.close();
     _backgroundWorkerStarted = false;
   });
@@ -533,8 +560,8 @@ class _GpsTrackerScreenState extends State<GpsTrackerScreen> {
 
     try {
       await initializeBackgroundService(
-        autoStart: false,
-        autoStartOnBoot: false,
+        autoStart: true,
+        autoStartOnBoot: true,
       );
       await _checkLocationPermissions();
 
